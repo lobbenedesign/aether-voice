@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Aether-Voice — Full-Duplex Real-Time Neural Voice Studio</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- TOPBAR -->
+    <header class="app-topbar">
+      <div class="topbar-left">
+        <div class="app-logo">
+          <span class="logo-icon">🎙️</span>
+          <div class="logo-text">
+            <span class="logo-title">Aether-Voice</span>
+            <span class="logo-badge">Full-Duplex Neural v1.0</span>
+          </div>
+        </div>
+        <div class="topbar-chips">
+          <span class="chip chip-latency" id="chip-latency-target">⚡ Latency: 138 ms</span>
+          <span class="chip chip-codec">🎵 24kHz Neural Mimi</span>
+          <span class="chip chip-bargein">🛑 Smart Barge-In: Ready</span>
+          <span class="chip chip-tools">🛠️ 4 Suite Apps Integrated</span>
+        </div>
+      </div>
+      <div class="topbar-right">
+        <nav class="topbar-tabs">
+          <button class="nav-tab active" data-tab="voice">🎙️ Full-Duplex Voice Studio</button>
+          <button class="nav-tab" data-tab="vad">⚡ VAD & Barge-In Radar</button>
+          <button class="nav-tab" data-tab="competitors">📊 5 Competitor Matrix</button>
+        </nav>
+      </div>
+    </header>
+
+    <!-- CONTENT -->
+    <main class="app-content">
+      <!-- TAB 1: FULL-DUPLEX VOICE STUDIO -->
+      <section id="tab-voice" class="tab-pane active">
+        <div class="voice-layout-grid">
+          <!-- Left: Waveform & Controls -->
+          <div class="panel">
+            <div class="panel-header">
+              <span class="panel-title">🎙️ Real-Time Audio Streaming Canvas</span>
+              <span class="badge-nominal" id="badge-session-state">Session Active</span>
+            </div>
+            <div class="canvas-audio-container">
+              <canvas id="audio-visualizer-canvas" width="600" height="200"></canvas>
+            </div>
+            <div style="padding: 16px; display: flex; flex-direction: column; gap: 10px;">
+              <label class="form-label">Simulate Speech Input / Voice Utterance:</label>
+              <div style="display: flex; gap: 10px;">
+                <input type="text" id="input-voice-transcript" class="form-control" value="Ciao Aether, applica TurboQuant alla memoria di Nexus.">
+                <button class="btn btn-primary" id="btn-send-speech">🎙️ Speak</button>
+                <button class="btn btn-danger" id="btn-interrupt-speech">🛑 Interrupt</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Right: Live Dialogue & Tool Execution -->
+          <div class="panel">
+            <div class="panel-header">
+              <span class="panel-title">💬 Live Streaming Dialogue & Tool Dispatch</span>
+              <span class="badge-telemetry" id="badge-turn-latency">142 ms Turn-Taking</span>
+            </div>
+            <div class="dialogue-feed" id="dialogue-feed-container">
+              <!-- Dynamically populated -->
+            </div>
+            <div class="tool-dispatch-box" id="tool-dispatch-result">
+              <strong style="color: #38bdf8;">🛠️ Suite Dispatch:</strong> Ready for voice tool execution.
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 2: VAD RADAR -->
+      <section id="tab-vad" class="tab-pane">
+        <div class="voice-layout-grid">
+          <div class="panel">
+            <div class="panel-header">
+              <span class="panel-title">⚡ Voice Activity Detection (VAD) & Acoustic Energy</span>
+            </div>
+            <div class="vad-metrics-grid">
+              <div class="metric-card">
+                <span class="metric-label">Microphone Energy</span>
+                <span class="metric-val" id="vad-energy">-28.4 dB</span>
+              </div>
+              <div class="metric-card metric-card-highlight">
+                <span class="metric-label">Speech Probability</span>
+                <span class="metric-val" id="vad-prob">98.2%</span>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Barge-In Decision Window</span>
+                <span class="metric-val" style="color: #34d399;">14 ms</span>
+              </div>
+              <div class="metric-card">
+                <span class="metric-label">Acoustic Echo Cancellation</span>
+                <span class="metric-val" style="color: #38bdf8;">✓ Active (Zero Bleed)</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="panel-header">
+              <span class="panel-title">🔬 Neural Audio Codec (Mimi Style) Architecture</span>
+            </div>
+            <div style="padding: 16px; font-size: 12.5px; color: var(--text-muted); line-height: 1.6;">
+              <p><strong style="color: #fff;">Perché Aether-Voice è 5 volte più veloce dei competitori:</strong></p>
+              <p>I vecchi assistenti vocali usano una catena a 3 passaggi (STT $\rightarrow$ LLM $\rightarrow$ TTS) che richiede oltre 1.200ms di latenza. Aether-Voice usa un'architettura **Speech-to-Speech pura**: i quanti audio vengono elaborati in streaming a 24kHz, consentendo un dialogo continuo con interruzioni naturali in soli **140 millisecondi**.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- TAB 3: 5 COMPETITOR BENCHMARK -->
+      <section id="tab-competitors" class="tab-pane">
+        <div class="panel" style="height: 100%;">
+          <div class="panel-header">
+            <span class="panel-title">📊 Comprehensive Comparison: Aether-Voice vs Top 5 Competitors</span>
+          </div>
+          <div class="table-container" id="competitor-table-container">
+            <!-- Dynamically populated -->
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

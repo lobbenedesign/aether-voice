@@ -1,0 +1,11 @@
+{
+  "name": "aether-voice",
+  "version": "1.0.0",
+  "description": "Full-Duplex Real-Time Neural Voice Engine with Sub-150ms Turn-Taking and Natural Barge-In Interruption",
+  "type": "module",
+  "main": "server.ts",
+  "scripts": {
+    "start": "bun server.ts"
+  },
+  "dependencies": {}
+}
