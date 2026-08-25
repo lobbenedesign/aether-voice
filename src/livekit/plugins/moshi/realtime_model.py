@@ -377,32 +377,120 @@ class RealtimeSession(llm.RealtimeSession):
         )
 
     async def _main_task(self) -> None:
-        acquire_start = time.time()
-        try:
-            self._http_session = aiohttp.ClientSession()
-            self._ws = await self._http_session.ws_connect(
-                self._opts.url, timeout=self._opts.connect_timeout
-            )
-        except Exception as e:
-            self._emit_error(
-                ConnectionError(
-                    f"could not connect to Moshi server at {self._opts.url}: {e}. "
-                    "did you start one? see MoshiConnectOptions."
-                ),
-                recoverable=False,
-            )
-            return
+        """Connect, run the recv loop, and — unlike a one-shot connection —
+        reconnect with exponential backoff if the websocket drops
+        unexpectedly (server restart, network blip, reverse-proxy idle
+        timeout), instead of ending the session on the first hiccup.
 
-        self._report_connection_acquired(time.time() - acquire_start)
-        self._start_generation()
+        Moshi's protocol has no session-resume mechanism (see models.py):
+        each reconnect is a brand-new websocket, a brand-new Opus
+        encoder/decoder pair (Opus is a stateful codec — reusing one across
+        a fresh connection produces garbage), and, semantically, a new
+        "generation" — Moshi has no server-side concept of resuming the old
+        one. `chat_ctx`/audio already in flight before the drop is lost;
+        this recovers the *connection*, not conversation continuity. That
+        matches what the wire protocol can actually offer, same honesty
+        policy as the rest of this plugin.
+        """
+        attempt = 0
+        first_connect = True
+        while not self._closed:
+            acquire_start = time.time()
+            try:
+                self._http_session = self._http_session or aiohttp.ClientSession()
+                self._ws = await self._http_session.ws_connect(
+                    self._opts.url, timeout=self._opts.connect_timeout
+                )
+            except Exception as e:
+                if attempt < self._opts.max_reconnect_attempts:
+                    delay = self._reconnect_delay(attempt)
+                    logger.warning(
+                        f"could not connect to Moshi server at {self._opts.url} "
+                        f"(attempt {attempt + 1}/{self._opts.max_reconnect_attempts}): {e}. "
+                        f"retrying in {delay:.1f}s"
+                    )
+                    attempt += 1
+                    await asyncio.sleep(delay)
+                    continue
+                self._emit_error(
+                    ConnectionError(
+                        f"could not connect to Moshi server at {self._opts.url}: {e}. "
+                        "did you start one? see MoshiConnectOptions. "
+                        f"gave up after {attempt} reconnect attempt(s)."
+                    ),
+                    recoverable=False,
+                )
+                return
 
+            self._report_connection_acquired(time.time() - acquire_start)
+
+            if first_connect:
+                first_connect = False
+            else:
+                # A fresh websocket needs a fresh, un-primed Opus codec pair —
+                # the old ones hold state from the dead connection's stream.
+                self._opus_writer = sphn.OpusStreamWriter(MOSHI_SAMPLE_RATE)
+                self._opus_reader = sphn.OpusStreamReader(MOSHI_SAMPLE_RATE)
+                self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
+                logger.info(f"Moshi session reconnected after {attempt} attempt(s)")
+
+            self._start_generation()
+            connected_at = time.monotonic()
+            clean_close = await self._recv_loop()
+            connection_lifetime = time.monotonic() - connected_at
+
+            if self._generation is not None:
+                self._generation.finish()
+
+            if self._closed or clean_close:
+                return
+
+            if connection_lifetime >= self._opts.reconnect_stable_after:
+                # It stayed up a while before dropping — treat the server/network
+                # as healthy and don't let this drop count against the retry
+                # budget, same idea OpenAI's realtime plugin backoff uses.
+                attempt = 0
+
+            if attempt >= self._opts.max_reconnect_attempts:
+                self._emit_error(
+                    ConnectionError(
+                        f"Moshi websocket at {self._opts.url} dropped and "
+                        f"reconnect gave up after {attempt} attempt(s)."
+                    ),
+                    recoverable=False,
+                )
+                return
+
+            delay = self._reconnect_delay(attempt)
+            logger.warning(
+                f"Moshi websocket dropped unexpectedly after {connection_lifetime:.2f}s; "
+                f"reconnecting in {delay:.1f}s "
+                f"(attempt {attempt + 1}/{self._opts.max_reconnect_attempts})"
+            )
+            attempt += 1
+            await asyncio.sleep(delay)
+
+    def _reconnect_delay(self, attempt: int) -> float:
+        return min(
+            self._opts.reconnect_backoff_base * (2**attempt),
+            self._opts.reconnect_backoff_max,
+        )
+
+    async def _recv_loop(self) -> bool:
+        """Reads frames off `self._ws` until it closes or errors.
+
+        Returns True for a clean, server-initiated close (nothing to
+        reconnect for) and False for anything that looks like an
+        unexpected drop worth retrying.
+        """
+        assert self._ws is not None
         try:
             async for message in self._ws:
                 if message.type == aiohttp.WSMsgType.CLOSED:
-                    break
+                    return True
                 if message.type == aiohttp.WSMsgType.ERROR:
-                    self._emit_error(RuntimeError(str(self._ws.exception())), recoverable=False)
-                    break
+                    logger.warning(f"Moshi websocket error: {self._ws.exception()}")
+                    return False
                 if message.type != aiohttp.WSMsgType.BINARY:
                     continue
 
@@ -419,13 +507,14 @@ class RealtimeSession(llm.RealtimeSession):
                     self._handle_text_payload(payload)
                 else:
                     logger.warning(f"unknown Moshi message kind {kind}")
+            # async-for ended without an explicit CLOSED/ERROR message, e.g. the
+            # TCP connection was reset out from under aiohttp.
+            return False
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            self._emit_error(e, recoverable=False)
-        finally:
-            if self._generation is not None:
-                self._generation.finish()
+            logger.warning(f"Moshi websocket recv loop raised: {e}")
+            return False
 
     def _handle_audio_payload(self, payload: bytes) -> None:
         if self._generation is None or self._generation.local_mute:

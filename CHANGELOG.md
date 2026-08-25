@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.2.0 — automatic websocket reconnection with backoff
+
+**Gap and source.** LiveKit's own `livekit-plugins-openai` reconnects its
+Realtime API websocket with exponential backoff and emits
+`session_reconnected` on success (`livekit/agents` PR #925, issue #2341,
+and issue #3145 about capping retries on a permanently broken server —
+checked via WebSearch against the actual `livekit/agents` GitHub repo, not
+assumed from memory). This plugin's `RealtimeSession._main_task` had no
+such thing: any dropped websocket — server restart, network blip, proxy
+timeout — ended the session for good, with no automatic path back, even
+though `llm.RealtimeSession` already defines a `session_reconnected` event
+for exactly this that this plugin simply never emitted.
+
+### Added
+- `MoshiConnectOptions.max_reconnect_attempts` / `reconnect_backoff_base` /
+  `reconnect_backoff_max` / `reconnect_stable_after` (`models.py`)
+- Reconnect loop in `RealtimeSession._main_task` (`realtime_model.py`):
+  on an unexpected drop, retries the websocket connection with exponential
+  backoff, rebuilds the Opus encoder/decoder pair (a fresh connection needs
+  an un-primed codec — reusing the old one across a new stream is garbage),
+  starts a fresh generation, and emits `session_reconnected`. Gives up and
+  emits a normal `recoverable=False` error after the configured attempt
+  budget. A connection that stays up at least `reconnect_stable_after`
+  seconds before dropping resets the attempt counter, so a healthy server's
+  history of blips doesn't count against a later one.
+- `tests/test_reconnect.py` — two tests against a real local `aiohttp.web`
+  websocket server (not a mock of `RealtimeSession` itself): one drops the
+  first connection and asserts the plugin reconnects, emits
+  `session_reconnected`, and keeps receiving real messages afterward; the
+  other makes every connection drop immediately and asserts the plugin
+  gives up after its configured attempt budget instead of looping forever,
+  with a `recoverable=False` error.
+
+### What this does not do
+Moshi's wire protocol has no session-resume message. A reconnect is a new
+connection and a new generation — in-flight audio/text from the moment of
+the drop is lost. This recovers connectivity, not conversation state. Set
+`max_reconnect_attempts=0` for the old fail-once behavior.
+
+### Verified (2026-08-25)
+`pytest tests/` — 8/8 pass, including the two new reconnect tests, against
+a real (if minimal) local websocket server built for the test, exercising
+the actual `RealtimeSession._main_task` reconnect loop end to end — no
+mocking of the class under test. Also re-ran `scripts/check_moshi_server.py`
+against the same live `moshi_mlx.local_web` server (`kyutai/moshiko-mlx-q4`)
+used for the 0.1.0 numbers below to confirm the refactor didn't regress the
+non-reconnect path: handshake succeeded in 5.3ms.
+
 ## 0.1.0 — full rewrite, replaces the v1.0.0 "Aether-Voice" prototype
 
 **What changed and why.** v1.0.0 (`21b39c6`, `4d357e5`, `0680efe`) shipped a

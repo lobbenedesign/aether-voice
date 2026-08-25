@@ -46,3 +46,28 @@ class MoshiConnectOptions:
     """Full websocket URL to the Moshi server's chat endpoint."""
 
     connect_timeout: float = 10.0
+
+    max_reconnect_attempts: int = 5
+    """How many times to retry the websocket after it drops unexpectedly
+    (server restart, network blip, proxy timeout) before giving up and
+    emitting a non-recoverable error. Set to 0 to disable reconnection
+    entirely and match the old fail-once behavior. A clean, explicit
+    ``aclose()`` never triggers a reconnect attempt."""
+
+    reconnect_backoff_base: float = 0.5
+    """Seconds to wait before the first reconnect attempt. Each subsequent
+    attempt doubles this (0.5s, 1s, 2s, 4s, ...), capped at
+    ``reconnect_backoff_max``."""
+
+    reconnect_backoff_max: float = 10.0
+    """Upper bound on the exponential reconnect backoff, in seconds."""
+
+    reconnect_stable_after: float = 5.0
+    """A connection that stayed up at least this long before dropping is
+    treated as evidence the server (and network path) are basically healthy,
+    so the reconnect backoff counter resets to 0 rather than continuing to
+    climb. Without this, a server that drops every connection instantly
+    (never staying up ``reconnect_stable_after`` seconds) exhausts
+    ``max_reconnect_attempts`` and this plugin gives up for good — which is
+    the intended behavior for a genuinely dead/misconfigured server, as
+    opposed to an occasional blip on an otherwise-fine one."""
