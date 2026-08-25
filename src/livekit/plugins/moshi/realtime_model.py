@@ -200,6 +200,7 @@ class RealtimeSession(llm.RealtimeSession):
         # Moshi has exactly one perpetual "generation" for the life of a
         # connection: there is no server-side concept of discrete turns.
         self._generation: _Generation | None = None
+        self._connected_at_mono: float | None = None
         self._closed = False
 
         self._main_atask = asyncio.create_task(self._main_task())
@@ -329,6 +330,22 @@ class RealtimeSession(llm.RealtimeSession):
         if self._http_session is not None:
             await self._http_session.close()
 
+        # Cancelling _main_atask above interrupts _recv_loop mid-`async for`,
+        # so the `generation.finish(session_duration=...)` call that
+        # ordinarily follows `_recv_loop()` in _main_task never runs on an
+        # explicit local close (as opposed to a server-initiated drop) — the
+        # generation's metrics would otherwise be silently lost instead of
+        # reported, on what is the single most common way a session ends in
+        # real usage (the caller shutting it down). Finish it here instead,
+        # with the connection lifetime measured up to this close.
+        if self._generation is not None and not self._generation.done:
+            session_duration = (
+                time.monotonic() - self._connected_at_mono
+                if self._connected_at_mono is not None
+                else 0.0
+            )
+            self._generation.finish(session_duration=session_duration)
+
     # -- connection + recv loop ---------------------------------------------
 
     def _resample(self, frame: rtc.AudioFrame):
@@ -436,11 +453,12 @@ class RealtimeSession(llm.RealtimeSession):
 
             self._start_generation()
             connected_at = time.monotonic()
+            self._connected_at_mono = connected_at
             clean_close = await self._recv_loop()
             connection_lifetime = time.monotonic() - connected_at
 
             if self._generation is not None:
-                self._generation.finish()
+                self._generation.finish(session_duration=connection_lifetime)
 
             if self._closed or clean_close:
                 return
@@ -552,6 +570,10 @@ class _Generation:
         self.done = False
         self.local_mute = False
 
+        self._created_at = time.time()
+        self._created_mono = time.monotonic()
+        self._first_audio_mono: float | None = None
+
         self._message_ch = utils.aio.Chan[llm.MessageGeneration]()
         self._function_ch = utils.aio.Chan[llm.FunctionCall]()
         self._text_ch = utils.aio.Chan[str]()
@@ -580,6 +602,8 @@ class _Generation:
         )
 
     def push_audio(self, frame: rtc.AudioFrame) -> None:
+        if self._first_audio_mono is None:
+            self._first_audio_mono = time.monotonic()
         if not self._audio_ch.closed:
             self._audio_ch.send_nowait(frame)
 
@@ -587,7 +611,7 @@ class _Generation:
         if not self._text_ch.closed:
             self._text_ch.send_nowait(text)
 
-    def finish(self) -> None:
+    def finish(self, *, session_duration: float = 0.0) -> None:
         if self.done:
             return
         self.done = True
@@ -599,3 +623,52 @@ class _Generation:
             self._function_ch.close()
         if not self._message_ch.closed:
             self._message_ch.close()
+        self._report_metrics(session_duration=session_duration)
+
+    def _report_metrics(self, *, session_duration: float) -> None:
+        """Emit a RealtimeModelMetrics `metrics_collected` event, same as
+        livekit-plugins-openai/gemini do after each response — see
+        `livekit.agents.metrics.RealtimeModelMetrics`. Moshi's protocol has no
+        token concept (it is not billed or reported in tokens), so
+        input/output/total_tokens are honestly 0 rather than invented; what's
+        real and measured here is timing: `duration` (how long this
+        generation was open), `ttft` (time from generation start to the first
+        real audio frame decoded off the wire — -1 if none arrived, e.g. an
+        immediate disconnect), and `session_duration` (how long the
+        underlying websocket connection stayed up). `cancelled` reflects
+        whether `interrupt()` was called on this generation (local-mute only,
+        per this plugin's honesty policy about what interrupt() can and
+        can't do over this protocol — see interrupt() above).
+        """
+        if self._session is None:
+            # `_Generation` constructed standalone (unit tests exercising
+            # framing/channel behavior without a real RealtimeSession) — no
+            # EventEmitter to report through.
+            return
+
+        from livekit.agents.metrics.base import Metadata, RealtimeModelMetrics
+
+        ttft = (
+            self._first_audio_mono - self._created_mono
+            if self._first_audio_mono is not None
+            else -1.0
+        )
+        self._session.emit(
+            "metrics_collected",
+            RealtimeModelMetrics(
+                label=self._session._realtime_model.label,
+                request_id=self.response_id,
+                timestamp=self._created_at,
+                duration=time.monotonic() - self._created_mono,
+                session_duration=session_duration,
+                ttft=ttft,
+                cancelled=self.local_mute,
+                input_tokens=0,
+                output_tokens=0,
+                total_tokens=0,
+                tokens_per_second=0.0,
+                input_token_details=RealtimeModelMetrics.InputTokenDetails(),
+                output_token_details=RealtimeModelMetrics.OutputTokenDetails(),
+                metadata=Metadata(model_name="moshi", model_provider="kyutai"),
+            ),
+        )

@@ -1,5 +1,65 @@
 # Changelog
 
+## 0.3.0 — per-generation `metrics_collected` (`RealtimeModelMetrics`)
+
+**Gap and source.** `livekit-agents`' own realtime plugins
+(`livekit-plugins-openai`, `livekit-plugins-gemini`) emit a
+`metrics_collected` event carrying `llm.RealtimeModelMetrics` after each
+response — confirmed via WebSearch against LiveKit's own docs
+(`docs.livekit.io/reference/recipes/metrics_realtime/`,
+`docs.livekit.io/reference/python/livekit/agents/metrics/`), which state
+this is what feeds `AgentSession`'s `UsageCollector`/logging hooks. This
+plugin only ever emitted the free connection-acquire metric the base
+`llm.RealtimeSession` class already reports (`_report_connection_acquired`,
+`acquire_time` only) — nothing about the generation itself, so an app
+wiring up the standard LiveKit metrics/usage pattern against this plugin got
+silence for the parts other providers report.
+
+### Added
+- `_Generation` (`realtime_model.py`) now tracks its own creation time and
+  the time its first real audio frame was decoded off the wire, and reports
+  a `RealtimeModelMetrics` event via `session.emit("metrics_collected", ...)`
+  when it ends: `ttft` (time to first audio frame, `-1.0` if none arrived),
+  `duration` (generation lifetime), `session_duration` (underlying websocket
+  connection lifetime), `cancelled` (whether `interrupt()` was called on it).
+  `input_tokens`/`output_tokens`/`total_tokens` are honestly `0` — Moshi's
+  wire protocol has no token concept, so there was nothing to report there
+  and nothing invented to fill the gap.
+- `RealtimeSession.aclose()` now finishes and reports metrics for the
+  in-flight generation before tearing down, instead of losing it: cancelling
+  `_main_atask` interrupts `_recv_loop` mid-iteration, so the
+  `generation.finish()` call that ordinarily follows `_recv_loop()` inside
+  `_main_task` was never reached on an explicit local close — the single
+  most common way a session actually ends in real usage (the caller shutting
+  it down). Fixed by finishing the generation explicitly in `aclose()`.
+- `tests/test_metrics.py` — two tests against a real local `aiohttp.web`
+  websocket server (not a mocked `RealtimeSession`): one streams a real
+  Opus-encoded audio frame after a real 0.15s server-side delay and asserts
+  the reported `ttft` reflects that real delay (not 0, not -1); the other
+  closes a generation that never received audio and asserts `ttft=-1.0`
+  specifically, not a fabricated `0.0`.
+- `scripts/check_metrics_live.py` — manual verification script against a
+  real Moshi server, used for the numbers below.
+
+### Verified (2026-08-25, same Apple M1 / `kyutai/moshiko-mlx-q4` as prior
+entries)
+`pytest tests/` — 10/10 pass, including the two new metrics tests, plus the
+existing capability/framing/reconnect/prewarm suite (prewarm test ran live
+against a real, currently-running `moshi_mlx.local_web` server rather than
+being skipped). Also ran `scripts/check_metrics_live.py` against that live
+server — streamed 3.0s of synthetic silence through the real plugin and
+printed the actual emitted events:
+
+```
+request_id=''                    ttft=-1.0000s duration=0.0000s session_duration=0.0000s acquire_time=0.0033s
+request_id='MOSHI_030f7616fe05'  ttft=0.0021s  duration=3.0134s session_duration=3.0133s acquire_time=0.0000s
+```
+
+`ttft=2.1ms` here is a single one-off local measurement against an
+already-warm process (no JIT cost in this run), consistent with — not a
+replacement for — the 20-44ms warm range measured across four runs in the
+0.1.0 entry; run-to-run variance is expected, same as it was there.
+
 ## 0.2.0 — automatic websocket reconnection with backoff
 
 **Gap and source.** LiveKit's own `livekit-plugins-openai` reconnects its

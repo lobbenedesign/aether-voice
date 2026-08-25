@@ -130,6 +130,50 @@ is `recoverable=False`. Also regression-checked against the live
 `moshi_mlx.local_web` server used for the numbers below
 (`scripts/check_moshi_server.py`, unaffected by this change).
 
+## Metrics
+
+Real competitor realtime plugins in `livekit-agents` (`livekit-plugins-openai`,
+`livekit-plugins-gemini`) emit `metrics_collected` events carrying a
+`RealtimeModelMetrics` payload after each response, which is what powers
+`AgentSession`'s built-in `UsageCollector`/logging hooks. This plugin
+previously emitted only the connection-acquire metric the base
+`llm.RealtimeSession` class reports for free (`acquire_time`, via
+`_report_connection_acquired`) — nothing about the generation itself. It now
+also reports one `RealtimeModelMetrics` event per generation, on
+`session.on("metrics_collected", ...)`, when that generation ends (session
+close, server-initiated drop, or reconnect):
+
+- `ttft` — real measured time from generation start to the first decoded
+  audio frame off the wire, or `-1.0` if none arrived (matches the documented
+  meaning of the field). Not turn-taking latency — see the caveat in "What's
+  verified vs. what isn't" above.
+- `duration` — how long the generation was open.
+- `session_duration` — how long the underlying websocket connection stayed up.
+- `input_tokens` / `output_tokens` / `total_tokens` — honestly `0`. Moshi's
+  wire protocol has no token concept and nothing is billed or reported in
+  tokens; a fabricated number here would be worse than an honest zero.
+- `cancelled` — whether `interrupt()` was called on this generation (local
+  mute only, per this plugin's existing honesty policy — see above).
+
+Verified against a real, live `moshi_mlx.local_web` server
+(2026-08-25, same Apple M1, same `kyutai/moshiko-mlx-q4` checkpoint as the
+numbers above), streaming synthetic silence for 3.0s and reading back the
+actual emitted events (`scripts/check_metrics_live.py`, reproducible):
+
+```
+request_id=''                    ttft=-1.0000s duration=0.0000s session_duration=0.0000s acquire_time=0.0033s
+request_id='MOSHI_030f7616fe05'  ttft=0.0021s  duration=3.0134s session_duration=3.0133s acquire_time=0.0000s
+```
+
+That `ttft=2.1ms` is consistent with the warm-server 20-44ms range measured
+above (same warm process, lower because this was silence into an already
+fully warmed-up model with no JIT cost at all in this particular run — expect
+it to vary run to run same as the warm numbers above do). Also
+unit-tested against a real local `aiohttp.web` websocket server in
+`tests/test_metrics.py`: one test asserts a real non-trivial `ttft` is
+reported when audio does arrive, the other asserts `ttft=-1.0` (not `0.0`)
+when a generation closes having received none.
+
 ## Setup
 
 Pick a backend and run its server — this repo does not bundle model weights
