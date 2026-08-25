@@ -1,91 +1,203 @@
-# 🎙️ Aether-Voice
+# livekit-plugins-moshi
 
-[![Bun](https://img.shields.io/badge/Bun-v1.4+-black.svg?logo=bun)](https://bun.sh/)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg?logo=typescript)](https://www.typescriptlang.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Audio](https://img.shields.io/badge/Latency-140ms%20%7C%2024kHz%20Full--Duplex-purple.svg)](#-features)
+A [LiveKit Agents](https://github.com/livekit/agents) `RealtimeModel` plugin that
+wraps a running [kyutai-labs/moshi](https://github.com/kyutai-labs/moshi) server
+— genuine full-duplex speech-to-speech, not a pipelined STT→LLM→TTS chain.
 
-[English 🇬🇧](#english) • [Italiano 🇮🇹](#italiano)
+> **This replaces the previous "Aether-Voice" project at this path.** v1 of that
+> project (commits `21b39c6`..`0680efe`) claimed a "140ms full-duplex neural
+> voice engine" that beat Moshi, OpenAI Realtime, and ElevenLabs on every
+> metric. It didn't run a model: text replies were keyword-matched strings,
+> audio was macOS `say` or a 440Hz sine beep, and the "140ms" was the time to
+> run that string match plus a subprocess call. See `CHANGELOG.md`. This
+> rewrite exists specifically to not repeat that.
 
-> **The Full-Duplex Real-Time Neural Voice Engine with Sub-150ms Turn-Taking, Natural Barge-In Interruption, and Voice-Driven Multi-App Tool Execution.**
->
-> *Il motore vocale neurale full-duplex in tempo reale con latenza di cambio turno inferiore a 150ms, interruzione naturale istantanea ed esecuzione vocale di strumenti su tutta la suite locale.*
+## What this actually is
 
-![Aether-Voice Dashboard](./public/screenshot.jpg)
-
----
-
-<a name="english"></a>
-## 🇬🇧 English Documentation
-
-### 🏆 Why Aether-Voice Crushes Legacy Voice Pipelines
-
-Traditional voice bots suffer from 1.5s - 3s latency due to sluggish pipelining (Speech-to-Text $\rightarrow$ LLM $\rightarrow$ Text-to-Speech). **Aether-Voice** delivers true Speech-to-Speech full-duplex interaction:
-
-1. **⚡ Sub-150ms Ultra-Low Latency**:
-   * True end-to-end 24kHz neural audio streaming for instantaneous responses.
-2. **🛑 Dual-Track Smart Barge-In**:
-   * High-precision VAD (Voice Activity Detection) immediately halts AI speech the moment you start talking without echo bleed.
-3. **🛠️ Voice-Triggered Multi-App Dispatcher**:
-   * Execute suite actions by voice (e.g. compress KV-cache in Nexus, query LightRAG in HyperRAG, or send WhatsApp messages via OmniClaw).
-4. **📊 Real-Time Audio Oscilloscope Canvas**:
-   * Live visualizer monitoring neural harmonics, decibel energy, and turn-taking response times.
-
----
-
-### 📊 Benchmark: Aether-Voice vs. Top 5 Competitors
-
-| Metric / Feature | 🎙️ **Aether-Voice** | **Kyutai Moshi** | **OpenAI Realtime** | **Mini-Omni2** | **ElevenLabs Conv** |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **Architecture** | **Speech-to-Speech** | Speech-to-Speech | Cloud WebRTC API | Speech-to-Speech | Pipelined STT-LLM |
-| **Turn-Taking Latency**| **140 ms** | 160 ms | 280 ms | 320 ms | 750 ms |
-| **Full-Duplex Barge-In**| **✓ Yes** | ✓ Yes | ✓ Yes | ✓ Yes | ✓ Yes |
-| **Local Offline Privacy**| **✓ 100% Local** | ✓ Local Python | ✗ Cloud API | ✓ Local | ✗ Cloud |
-| **Cost per Minute** | **$0.00** | $0.00 | $0.06 / min | $0.00 | $0.10 / min |
-| **Suite Tool Execution**| **✓ 4 Apps Linked**| ✗ No | ✓ Custom API | ✗ No | ✓ Webhooks |
-
----
-
-### 🛠️ Quick Start
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/lobbenedesign/aether-voice.git
-cd aether-voice
-
-# 2. Run with Bun
-bun server.ts
+```
+LiveKit Room (48kHz Opus, WebRTC)
+        │
+        ▼
+ RealtimeSession.push_audio()  ── resample to 24kHz mono, 80ms frames ──┐
+        │                                                               │
+        │                                              ┌────────────────▼───────────────┐
+        │                                              │ moshi-protocol server            │
+        │                                              │ ws://.../api/chat                │
+        │                                              │                                   │
+        │                                              │  moshi.server        (PyTorch,   │
+        │                                              │  moshi_mlx.local_web (MLX, M-ser.)│
+        │                                              │  rust server                      │
+        │                                              └────────────────┬───────────────┘
+        │                                                               │
+        ▼                                                               │
+ audio_ch / text_ch  ◄── decoded Opus audio + Moshi's own text tokens ──┘
+        │
+        ▼
+LiveKit AgentSession (plays audio back into the room)
 ```
 
-Open your browser at **`http://localhost:3006`**.
+`livekit/plugins/moshi/realtime_model.py` implements `llm.RealtimeModel` /
+`llm.RealtimeSession` from `livekit-agents` (verified against the interface in
+`livekit/agents/llm/realtime.py`, current as of this writing) and speaks the
+same binary websocket protocol Moshi's own reference client uses — verified by
+reading `moshi/moshi/client.py`, `moshi/moshi/server.py`, and
+`moshi_mlx/moshi_mlx/local_web.py` directly, not assumed. That protocol is
+intentionally minimal:
 
----
+| Byte 0 | Payload | Direction | Meaning |
+|---|---|---|---|
+| `0x01` | Opus-encoded audio | both | 24kHz mono PCM, Opus-coded, ~80ms frames |
+| `0x02` | UTF-8 text | server → client | Moshi's own text token, time-aligned to *its own* speech |
 
-<a name="italiano"></a>
-## 🇮🇹 Documentazione in Italiano
+There is no JSON control channel, no session-config message, no cancel
+message. That shapes everything below.
 
-### 🏆 Perché Aether-Voice Rivoluziona il Controllo Vocale
+## What this plugin honestly does NOT do
 
-I vecchi assistenti vocali hanno ritardi fastidiosi di oltre 2 secondi. **Aether-Voice** offre una conversazione vocale naturale in tempo reale:
+The temptation with a "competitor benchmark" project is to round every gap up
+to a checkmark. This one rounds down instead — `RealtimeCapabilities` is set
+to match what the wire protocol can actually carry, verified in
+`tests/test_capabilities.py`:
 
-1. **⚡ Latenza Sub-150ms**: Risposte vocali istantanee fluide come una telefonata reale.
-2. **🛑 Interruzione Naturale Istantanea (Barge-In)**: L'AI si zittisce all'istante appena prendi la parola.
-3. **🛠️ Esecuzione Strumenti a Voce**: Controlla Nexus Local Engine, HyperRAG e OmniClaw semplicemente parlando.
-4. **📊 Oscilloscopio Audio Neurale 2D**: Visualizzazione in tempo reale dello spettro e delle onde sonore a 24kHz.
+| Capability | Value | Why |
+|---|---|---|
+| `audio_output` | **True** | The one thing the protocol is built for |
+| `turn_detection` | False | No "user started/stopped speaking" message exists; layer a VAD (e.g. `livekit-plugins-silero`) in front if your `AgentSession` needs turn boundaries |
+| `user_transcription` | False | The text stream is Moshi's own inner monologue, not an ASR transcript of the user |
+| `mutable_instructions` | False | No system-prompt message type. Persona is fixed by the checkpoint you load |
+| `mutable_chat_context` | False | No way to inject history mid-session |
+| `mutable_tools` / `auto_tool_reply_generation` / `manual_function_calls` | False | Moshi is not an LLM with tool calling — it's a raw speech-to-speech dialogue model |
+| `message_truncation` | False | No server-side cancel/truncate message |
+| `supports_say` | False | No text-to-speech-only mode |
 
----
+`generate_reply()`, `commit_audio()`, `clear_audio()`, `truncate()`,
+`update_instructions()`, `update_chat_ctx()`, and `update_tools()` all either
+no-op with a logged warning or raise `RealtimeError` with an explanation,
+rather than silently pretending to work. `interrupt()` mutes local playout of
+already-generated audio (the only thing this protocol lets a client do) — it
+does **not** stop the model from generating server-side, because there is no
+message to ask it to.
 
-### 🛠️ Avvio Rapido
+This is a materially thinner integration than the OpenAI Realtime or Gemini
+Live plugins in the same `livekit-agents` repo, because Moshi's actual
+protocol is thinner. Anyone telling you otherwise about a Moshi integration is
+describing a project they haven't shipped yet.
+
+## Setup
+
+Pick a backend and run its server — this repo does not bundle model weights
+or start one for you:
 
 ```bash
-git clone https://github.com/lobbenedesign/aether-voice.git
-cd aether-voice
-bun server.ts
+# Apple Silicon (M1/M2/M3/M4), no discrete GPU required
+pip install moshi_mlx
+python -m moshi_mlx.local_web
+# downloads the model checkpoint (several GB) from Hugging Face on first run
+
+# CUDA GPU
+pip install moshi
+python -m moshi.server
 ```
 
-Apri il browser all'indirizzo **`http://localhost:3006`**.
+Both default to `ws://localhost:8998/api/chat`. Then:
 
----
+```bash
+pip install -e .
+python scripts/check_moshi_server.py   # real handshake check, prints round-trip time or the real error
+python examples/minimal_agent.py dev
+```
 
-## 📄 License
-Released under the [MIT License](LICENSE).
+### Prewarming
+
+The MLX backend lazily compiles its computation graph on first inference —
+measured at **2-4 seconds on every fresh server process** (see below; this
+recurs on each restart, it is not a one-time-per-machine cost). Call
+`moshi.prewarm` once at worker startup, via `livekit-agents`' own
+`prewarm_fnc` hook, so that cost lands before a real user connects, not
+during their first turn:
+
+```python
+from livekit.plugins import moshi
+cli.run_app(WorkerOptions(entrypoint_fnc=entrypoint, prewarm_fnc=moshi.prewarm))
+```
+
+`examples/minimal_agent.py` already does this.
+
+## What's verified vs. what isn't
+
+Verified by reading the source:
+- The wire protocol (byte-for-byte, from `client.py`/`server.py`/`local_web.py`)
+- The `livekit-agents` `RealtimeModel`/`RealtimeSession` ABC this plugin implements
+
+Verified by running it end-to-end on an Apple M1, 2026-08-25 — real
+`moshi_mlx.local_web` server (`kyutai/moshiko-mlx-q4` checkpoint, 4-bit
+quantized, ~5GB download), real websocket connection, this plugin's actual
+`push_audio()`/`RealtimeSession` code path, no mocks:
+
+- `scripts/check_moshi_server.py`: websocket handshake succeeded, **8.2ms**.
+- Full plugin round-trip, driven by a script that streams synthetic audio
+  (1s silence + a quiet 200Hz tone, paced in real time at 10ms/frame — a
+  live human mic was not available in the environment this was run in) and
+  times the first response frame the plugin emits:
+  - **Every fresh server process pays a 2-4 second JIT/graph-compile cost
+    on its first inference.** Measured across 4 independent clean restarts
+    (process confirmed killed via `lsof`/`ps` before each one, including one
+    after a full OS reboot that also cleared any OS-level shader cache):
+    **4043.6ms, 1938.9ms, 2229.7ms**, and an earlier run at **3037ms**. This
+    is a real, recurring per-process cost, not a one-time-per-machine cost —
+    an earlier draft of this README claimed the latter after seeing 336ms
+    and 9.8ms on what were meant to be fresh restarts; those turned out to
+    be confounded by leftover MLX worker subprocesses (`multiprocessing`
+    children of `moshi_mlx.local_web`) that a plain `kill` on the parent PID
+    didn't reap, so those two "restarts" were quietly reusing an
+    already-warm worker. Corrected here after re-testing with explicit
+    `lsof`-verified-clean kills before each restart. This is exactly the
+    kind of number `moshi.prewarm()` exists to move out of a user's first
+    turn — see Prewarming above.
+  - **Warm within a long-running process: 20–44ms** to first response audio
+    frame across 4 further in-process runs (20.0, 21.7, 21.6, 43.8ms).
+  - Text tokens (Moshi's own inner monologue) arrived inconsistently across
+    runs — 0, 10, 21, or 46 characters over the ~7s window — which tracks
+    with Moshi being a proactive, not purely reactive, speaker: it doesn't
+    only "answer," it also speaks unprompted, so how much text shows up in
+    a fixed window depends on what it was already saying.
+  - This measures **streaming latency once the model is warm and running**,
+    not conversational turn-taking latency (how fast it responds to the
+    *content* of something a person said) — the input was a tone, not
+    speech, so there's nothing for it to respond to contentwise. Kyutai's
+    own **160–200ms** figure is specifically about turn-taking and remains
+    their claim, not independently reproduced here; what was reproduced is
+    that the pipe itself, once warm, moves audio in tens of milliseconds,
+    not the ~700–1200ms of a cascaded STT→LLM→TTS setup.
+  - One discovery this run surfaced: the live server sends an undocumented
+    (in `client.py`) `0x00` handshake byte on connect — see `models.py` for
+    where that's now handled instead of logged as an unknown message kind.
+
+Not verified:
+- Turn-taking latency against real speech content (no live mic in this
+  environment — reproduce it yourself with `examples/minimal_agent.py`
+  against a real LiveKit room and a microphone)
+- Audio quality / MOS
+- Behavior under real network jitter, or over a longer session than ~7s
+- Anything about the PyTorch/CUDA backend (`moshi.server`) specifically —
+  only the MLX backend was run
+
+Re-run `scripts/check_moshi_server.py` and `examples/minimal_agent.py`
+yourself before trusting any number here for a decision that matters —
+including these.
+
+## Why nobody had built this already
+
+Checked before starting: LiveKit's own `livekit-plugins/` directory ships 60+
+provider integrations (OpenAI, Google, Anthropic, ElevenLabs, Ultravox,
+Cartesia, etc.) as of this writing, and none of them is Kyutai/Moshi. The
+likely reason, now that the protocol has been read end-to-end: Moshi's wire
+protocol is architecturally thinner than every other provider LiveKit
+integrates against (no control channel, no tools, no instructions), so
+wrapping it as a `RealtimeModel` means implementing an interface where most of
+the advanced surface area is honestly unsupported — less attractive to build
+than a provider where every capability flag can be `True`.
+
+## License
+
+MIT, consistent with the rest of the suite this project lives in.
