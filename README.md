@@ -73,10 +73,11 @@ to match what the wire protocol can actually carry, verified in
 `generate_reply()`, `commit_audio()`, `clear_audio()`, `truncate()`,
 `update_instructions()`, `update_chat_ctx()`, and `update_tools()` all either
 no-op with a logged warning or raise `RealtimeError` with an explanation,
-rather than silently pretending to work. `interrupt()` mutes local playout of
-already-generated audio (the only thing this protocol lets a client do) — it
-does **not** stop the model from generating server-side, because there is no
-message to ask it to.
+rather than silently pretending to work. `interrupt()` performs a local
+barge-in — flush queued playout audio, mute new frames for a short window,
+resume automatically (see "Barge-in / interruption" below) — it does **not**
+stop the model from generating server-side, because there is no message to
+ask it to.
 
 This is a materially thinner integration than the OpenAI Realtime or Gemini
 Live plugins in the same `livekit-agents` repo, because Moshi's actual
@@ -130,6 +131,53 @@ is `recoverable=False`. Also regression-checked against the live
 `moshi_mlx.local_web` server used for the numbers below
 (`scripts/check_moshi_server.py`, unaffected by this change).
 
+## Barge-in / interruption
+
+Real full-duplex systems handle the user talking over the assistant by
+actually stopping the in-flight output stream — LiveKit `AgentSession` calls
+`RealtimeSession.interrupt()` as soon as its VAD/turn-detection sees
+`input_speech_started` (see `agent_activity.py` in `livekit-agents`, the same
+`_on_start_of_speech` path OpenAI's and Gemini's realtime plugins are driven
+through). For a turn-based provider, `interrupt()` discards "the current
+response" and the *next* response starts as a brand-new, unmuted generation.
+
+Moshi doesn't have a next response to hand off to: the wire protocol gives
+this plugin exactly one perpetual generation for the life of the connection
+(see `RealtimeModel`'s docstring). The first version of `interrupt()` here
+set a sticky mute flag checked before every future audio frame — meaning the
+*first* barge-in of a session silenced all of Moshi's output for the rest of
+the connection, which is not what "interruption" means in any real system.
+
+`interrupt()` now does what it should:
+
+1. **Flushes** every audio frame already sitting in the local playout queue —
+   the actual "stop the in-flight stream" the user hears, immediately.
+2. **Mutes** newly-arrived frames for `MoshiConnectOptions.interrupt_flush_window`
+   (default 0.4s), because frames the server sends in the first moments after
+   an interrupt were almost always synthesized *before* it had processed
+   enough of the user's just-pushed audio to react — flushing the buffer
+   alone would still let stale speech leak through.
+3. **Resumes automatically** once the window elapses — there is no `resume()`
+   to call, because Moshi was never told to stop. It keeps listening
+   throughout (this plugin never sends anything resembling a cancel message —
+   there is none in the protocol), so by the time the window elapses it has
+   genuinely heard the user's speech and, per its full-duplex training, is
+   expected to yield the floor on its own.
+
+The Opus decoder itself is never starved during the mute window — packets
+still get decoded to keep the stateful codec's internal state current, only
+the resulting PCM is withheld from playout — so audio doesn't glitch on the
+frames right after resumption.
+
+Verified with `tests/test_barge_in.py` against a real local `aiohttp.web`
+websocket server that streams continuous Opus-encoded audio, no mocked
+`RealtimeSession`: one test records the wall-clock arrival time of every
+delivered frame, calls `interrupt()` mid-stream, and asserts zero frames
+arrive during the configured window and at least one arrives after it; a
+second asserts the resulting `metrics_collected` event reports
+`cancelled=True`. Also manually exercised against a live
+`moshi_mlx.local_web` server (`scripts/check_barge_in_live.py`).
+
 ## Metrics
 
 Real competitor realtime plugins in `livekit-agents` (`livekit-plugins-openai`,
@@ -152,8 +200,10 @@ close, server-initiated drop, or reconnect):
 - `input_tokens` / `output_tokens` / `total_tokens` — honestly `0`. Moshi's
   wire protocol has no token concept and nothing is billed or reported in
   tokens; a fabricated number here would be worse than an honest zero.
-- `cancelled` — whether `interrupt()` was called on this generation (local
-  mute only, per this plugin's existing honesty policy — see above).
+- `cancelled` — whether `interrupt()` was ever called on this generation (a
+  local barge-in: flush + brief mute window, see "Barge-in / interruption"
+  above), not whether the generation actually ended early — Moshi has no
+  per-generation end to cancel in the first place.
 
 Verified against a real, live `moshi_mlx.local_web` server
 (2026-08-25, same Apple M1, same `kyutai/moshiko-mlx-q4` checkpoint as the

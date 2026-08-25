@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "livekit-plugins-moshi"
-version = "0.3.0"
+version = "0.4.0"
 description = "LiveKit Agents realtime plugin wrapping a Moshi-protocol server (kyutai-labs/moshi)"
 readme = "README.md"
 requires-python = ">=3.9"

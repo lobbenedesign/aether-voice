@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.4.0 — real barge-in: flush + bounded mute instead of permanent mute
+
+**Gap and source.** LiveKit `AgentSession` calls `RealtimeSession.interrupt()`
+as soon as its VAD/turn-detection fires `input_speech_started` — the same
+call site OpenAI's and Gemini's realtime plugins are driven through (see
+`agent_activity.py` in `livekit-agents`, and Pipecat's equivalent
+interruption-on-user-speech pattern). For those turn-based providers,
+`interrupt()` discards "the current response" and the *next* response is a
+fresh, unmuted generation — interruption only ever affects the response being
+cut off.
+
+Moshi has exactly one perpetual generation per connection (no server-side
+concept of a "next response" — see `RealtimeModel`'s docstring), and the
+previous `interrupt()` set a sticky `local_mute` flag checked before every
+subsequent audio frame for the rest of the connection. That meant the
+*first* barge-in of any session silenced all of Moshi's output forever
+after — clearly not what an "interruption" feature is supposed to do, and
+not caught earlier because no test exercised more than one interrupt-like
+scenario per generation.
+
+### Changed
+- `RealtimeSession.interrupt()` (`realtime_model.py`) now performs a bounded
+  local barge-in instead of a permanent mute: it immediately flushes every
+  audio frame already queued for local playout (the actual "stop the
+  in-flight stream" a user hears), then drops newly-arrived frames for
+  `MoshiConnectOptions.interrupt_flush_window` (new option, default 0.4s) to
+  cover audio the server had already synthesized before it could react to
+  the interruption, then lets relaying resume automatically — there is no
+  manual "resume" step, because Moshi is never told to stop and keeps
+  listening throughout.
+- `_Generation` replaces its sticky `local_mute: bool` with `interrupted: bool`
+  (permanent, for the `cancelled` metric) and a time-bounded
+  `_mute_until_mono` gate (`is_muted()`), plus an `interrupt(flush_window)`
+  method that drains the local audio channel and returns how many frames it
+  flushed.
+- `_handle_audio_payload` now always feeds incoming Opus packets to the
+  decoder, even while muted — Opus is a stateful stream codec, and skipping
+  packets instead of just withholding their decoded PCM would desync decoder
+  state and glitch the first frames once playout resumes.
+- `metrics_collected`'s `cancelled` field now reflects `interrupted` (was
+  interrupt() ever called on this generation), decoupled from the temporary
+  mute window.
+
+### Added
+- `MoshiConnectOptions.interrupt_flush_window` (default 0.4s, roughly
+  double Kyutai's published ~200ms latency figure for margin — not
+  independently benchmarked, tune against your own deployment).
+
+Verified with `tests/test_barge_in.py` (2 new tests) against a real local
+`aiohttp.web` websocket server streaming continuous Opus-encoded audio, not
+a mocked `RealtimeSession`: one records real wall-clock arrival timestamps
+of delivered frames, calls `interrupt()` mid-stream, and asserts zero frames
+land during the configured window and at least one lands after it (playout
+resumes on its own); the other asserts the resulting `metrics_collected`
+event reports `cancelled=True`. Full suite: 12/12 passing
+(`pytest tests/`). Also manually exercised against a live
+`moshi_mlx.local_web` server via the new `scripts/check_barge_in_live.py`.
+
 ## 0.3.0 — per-generation `metrics_collected` (`RealtimeModelMetrics`)
 
 **Gap and source.** `livekit-agents`' own realtime plugins

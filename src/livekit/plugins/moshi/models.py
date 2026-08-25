@@ -71,3 +71,30 @@ class MoshiConnectOptions:
     ``max_reconnect_attempts`` and this plugin gives up for good — which is
     the intended behavior for a genuinely dead/misconfigured server, as
     opposed to an occasional blip on an otherwise-fine one."""
+
+    interrupt_flush_window: float = 0.4
+    """How long, in seconds, ``RealtimeSession.interrupt()`` keeps dropping
+    freshly-arrived server audio after being called, on top of flushing
+    whatever was already buffered locally.
+
+    Why this exists: Moshi is a genuinely full-duplex model with exactly one
+    perpetual generation per connection (see ``RealtimeModel`` docstring), not
+    a turn-based one that starts a fresh generation after every interruption.
+    ``interrupt()`` therefore can't just discard "the current response" the
+    way the OpenAI/Gemini realtime plugins do — there is no next response to
+    hand off to. What it does instead: drop every audio frame already sitting
+    in the local playout queue (the actual "stop the in-flight stream" part
+    of barge-in — same immediate effect a user hears), then keep dropping
+    newly-arrived frames for this window, because frames the server sends
+    in the first moments after an interrupt were almost always synthesized
+    *before* the server had processed enough of the user's just-pushed audio
+    to react to it — deleting only the buffer would still let a few hundred
+    ms of stale speech leak through. After the window, relaying resumes
+    automatically: Moshi keeps listening throughout (this plugin never sends
+    anything resembling a cancel message, because the wire protocol has none
+    — see models.py's framing comment), so by the time this window elapses it
+    has genuinely heard the user's speech and, per its full-duplex training,
+    is expected to yield the floor on its own rather than needing to be told.
+    0.4s is a rough estimate (roughly Kyutai's published ~200ms latency
+    figure doubled for margin), not independently benchmarked here — tune it
+    against your own deployment's measured latency."""

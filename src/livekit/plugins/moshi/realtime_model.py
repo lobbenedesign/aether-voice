@@ -10,6 +10,8 @@ import numpy as np
 from livekit import rtc
 from livekit.agents import NOT_GIVEN, NotGivenOr, llm, utils
 
+from livekit.agents.utils.aio.channel import ChanEmpty
+
 from .log import logger
 from .models import MOSHI_CHANNELS, MOSHI_FRAME_SIZE, MOSHI_SAMPLE_RATE, MoshiConnectOptions
 
@@ -130,9 +132,15 @@ class RealtimeModel(llm.RealtimeModel):
       an ASR transcript of what the user said. ``user_transcription`` is False.
     - No response cancellation. Because the model runs continuously, there is no
       wire message to tell it "stop, discard that". ``interrupt()`` on this
-      session stops relaying already-generated audio into the room; it does not
+      session performs a local barge-in instead: it immediately flushes any
+      already-decoded audio still queued for playout (stopping the in-flight
+      stream the caller actually hears) and drops newly-arrived frames for a
+      short configurable window (``MoshiConnectOptions.interrupt_flush_window``)
+      to cover audio the server had already synthesized before it could react
+      to the interruption, then resumes relaying automatically. It does not
       (and structurally cannot, over this protocol) stop the model from having
-      generated it.
+      generated that audio server-side, and it is not a substitute for the
+      model's own full-duplex reaction to hearing the user again.
 
     What *is* real: genuine full-duplex, single-model speech-to-speech audio,
     with the low latency that architecture implies (Kyutai's own published
@@ -296,16 +304,26 @@ class RealtimeSession(llm.RealtimeSession):
         )
 
     def interrupt(self) -> None:
-        # There is no cancel/truncate message in the wire protocol. Best-effort
-        # local interruption: stop relaying already-generated audio into the
-        # room. The model itself keeps generating server-side — this plugin
-        # cannot stop that over this protocol, and does not claim to.
+        # There is no cancel/truncate message in the wire protocol, and Moshi
+        # has exactly one perpetual generation for the life of the connection
+        # (not a fresh one per response like OpenAI/Gemini), so this can't
+        # just discard "the current response" and hand off to a next one.
+        # Best-effort local barge-in instead: drop whatever's already queued
+        # for playout right now (the audible in-flight stream), then keep
+        # dropping freshly-arrived frames for a short window to cover audio
+        # the server synthesized before it could react — see
+        # MoshiConnectOptions.interrupt_flush_window for why. Playout resumes
+        # automatically after the window; there is nothing to "resume"
+        # manually, because the model was never told to stop and keeps
+        # listening and generating throughout.
         if self._generation is not None:
-            self._generation.local_mute = True
-        logger.debug(
-            "interrupt(): muted local playout of Moshi's output; the model "
-            "itself is not stopped (no cancel message exists in its protocol)"
-        )
+            flushed = self._generation.interrupt(self._opts.interrupt_flush_window)
+            logger.debug(
+                f"interrupt(): flushed {flushed} queued audio frame(s) and will "
+                f"drop new ones for {self._opts.interrupt_flush_window:.2f}s; "
+                "the model itself is not stopped (no cancel message exists in "
+                "its protocol) and playout resumes automatically after the window"
+            )
 
     def truncate(
         self,
@@ -535,10 +553,16 @@ class RealtimeSession(llm.RealtimeSession):
             return False
 
     def _handle_audio_payload(self, payload: bytes) -> None:
-        if self._generation is None or self._generation.local_mute:
+        if self._generation is None:
             return
+        # Opus is a stateful stream codec: every packet has to keep going
+        # through the decoder (even while muted after an interrupt()) or its
+        # internal state falls behind and produces audible glitches on the
+        # first frames once playout resumes. Decode unconditionally; only the
+        # decision to hand the resulting PCM to the generation is gated on
+        # mute state.
         pcm_f32 = self._opus_reader.append_bytes(payload)
-        if pcm_f32 is None or len(pcm_f32) == 0:
+        if pcm_f32 is None or len(pcm_f32) == 0 or self._generation.is_muted():
             return
         pcm_i16 = np.clip(pcm_f32, -1.0, 1.0)
         pcm_i16 = (pcm_i16 * 32767.0).astype(np.int16)
@@ -568,7 +592,12 @@ class _Generation:
         self._session = session
         self.response_id = utils.shortuuid("MOSHI_")
         self.done = False
-        self.local_mute = False
+        # Whether interrupt() was ever called on this generation — reported
+        # as `cancelled` in metrics. Distinct from the mute window below:
+        # that's a temporary playout gate, this is a permanent "was this
+        # generation ever barged in on" flag.
+        self.interrupted = False
+        self._mute_until_mono: float | None = None
 
         self._created_at = time.time()
         self._created_mono = time.monotonic()
@@ -607,6 +636,24 @@ class _Generation:
         if not self._audio_ch.closed:
             self._audio_ch.send_nowait(frame)
 
+    def is_muted(self) -> bool:
+        return self._mute_until_mono is not None and time.monotonic() < self._mute_until_mono
+
+    def interrupt(self, flush_window: float) -> int:
+        """Local barge-in: drop whatever's already queued for playout, then
+        keep dropping newly-arrived audio for `flush_window` seconds. Returns
+        the number of frames flushed from the local queue, for logging."""
+        self.interrupted = True
+        self._mute_until_mono = time.monotonic() + flush_window
+        flushed = 0
+        while not self._audio_ch.closed:
+            try:
+                self._audio_ch.recv_nowait()
+                flushed += 1
+            except ChanEmpty:
+                break
+        return flushed
+
     def push_text(self, text: str) -> None:
         if not self._text_ch.closed:
             self._text_ch.send_nowait(text)
@@ -636,9 +683,12 @@ class _Generation:
         real audio frame decoded off the wire — -1 if none arrived, e.g. an
         immediate disconnect), and `session_duration` (how long the
         underlying websocket connection stayed up). `cancelled` reflects
-        whether `interrupt()` was called on this generation (local-mute only,
-        per this plugin's honesty policy about what interrupt() can and
-        can't do over this protocol — see interrupt() above).
+        whether `interrupt()` was ever called on this generation (a local
+        barge-in: flush the playout queue plus a brief mute window), not
+        whether the generation actually ended early — Moshi has no
+        per-generation end to cancel in the first place, per this plugin's
+        honesty policy about what interrupt() can and can't do over this
+        protocol (see interrupt() above).
         """
         if self._session is None:
             # `_Generation` constructed standalone (unit tests exercising
@@ -662,7 +712,7 @@ class _Generation:
                 duration=time.monotonic() - self._created_mono,
                 session_duration=session_duration,
                 ttft=ttft,
-                cancelled=self.local_mute,
+                cancelled=self.interrupted,
                 input_tokens=0,
                 output_tokens=0,
                 total_tokens=0,
