@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -e ".[dev]"
+
+      # test_prewarm_against_live_server (tests/test_prewarm_live.py) skips
+      # itself honestly when no real Moshi server is reachable at
+      # MOSHI_URL — expected here, this runner doesn't run one.
+      - run: pytest tests -v
